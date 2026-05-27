@@ -1,79 +1,98 @@
-# panel-sdk-go
+## panel-sdk-go
 
-Go 1.22+ SDK for [panel](https://github.com/UltraInstinct0x/panel). Standard library only.
+Go 1.22+ SDK for panel operator endpoints.
 
 ```bash
 go get github.com/UltraInstinct0x/panel-sdk-go
 ```
 
-## Options
+SDK version constant:
 
 ```go
-type Options struct {
-    BaseURL          string
-    SiteKey          string
-    SiteSecret       string
-    SiteSecretSource string // "env" (default) or "raw"
-    ScrubberMode     string // "off" (default), "self-sign", "proxy"
-    ScrubberSecret   string // required for self-sign
-    ScrubberURL      string // required for proxy mode
-    EngineVersion    string // default: "0.2.0"
-    TimeoutSeconds   float64 // default: 10.0
-    MaxRetries       int     // default: 0
-}
+panelsdk.Version // "0.2.0"
 ```
 
-`SiteSecretSource="raw"` adds `x-panel-ingest-secret` for dual-secret server mode.
-
-## Clients
-
-`New(o Options) *Client` remains the entry point and exposes:
-
-- `Client` operator methods:
-  - `IngestTrace(ctx, in)`
-  - `IngestTraceAndWait(ctx, in, maxWaitSeconds, pollIntervalSeconds)`
-  - `FetchTrace(ctx, traceID)`
-  - `IngestUnits(ctx, payload)`
-  - `ScoreUnit(ctx, ref, id)`
-  - `SkillReview(ctx, input)`
-  - `VerifyToken(ctx, token)`
-- `Client.Rater` rater methods:
-  - `NextUnit(ctx, pool, raterID)`
-  - `SubmitJudgment(ctx, input)`
-
-All public methods take `context.Context` first.
-
-## Example
+## Quick start
 
 ```go
 ctx := context.Background()
 
 c := panelsdk.New(panelsdk.Options{
-    BaseURL:      "https://panel.example.com",
-    SiteKey:      os.Getenv("PANEL_SITE_KEY"),
-    SiteSecret:   os.Getenv("PANEL_SITE_SECRET"),
-    ScrubberMode: "self-sign",
-    ScrubberSecret: os.Getenv("SCRUBBER_JWT_SECRET"),
-    MaxRetries:   3,
+	BaseURL:        "https://panel.example.com",
+	SiteKey:        os.Getenv("PANEL_SITE_KEY"),
+	SiteSecret:     os.Getenv("PANEL_INGEST_SECRET"),
+	ScrubberSecret: os.Getenv("SCRUBBER_JWT_SECRET"),
 })
+```
 
-trace, err := c.IngestTrace(ctx, panelsdk.IngestTraceInput{
-    SourceAgent: "myapp",
-    Blob: map[string]interface{}{"messages": []string{"hello"}},
+## Verify
+
+```go
+vr, err := c.VerifyToken(ctx, token)
+if err != nil {
+	log.Fatal(err)
+}
+fmt.Println(vr.OK)
+```
+
+## Ingest a unit
+
+```go
+u, err := c.IngestUnit(ctx, panelsdk.IngestUnitInput{
+	Type:    "process_output_rating",
+	Payload: map[string]any{"passage": "model output"},
+}, panelsdk.WithExternalRef("ext-123"))
+if err != nil {
+	log.Fatal(err)
+}
+fmt.Println(u.Accepted, u.IDs)
+```
+
+## Ingest a trace and fetch status
+
+```go
+tr, err := c.IngestTrace(ctx, panelsdk.IngestTraceInput{
+	TraceID:     "tr_demo_1",
+	SourceAgent: "sdk-demo",
+	Blob:        map[string]any{"messages": []string{"hello"}},
 })
 if err != nil {
-    var rl *panelsdk.RateLimitError
-    if errors.As(err, &rl) {
-        // rl.Scope, rl.RetryAfter
-    }
+	log.Fatal(err)
 }
 
-if trace.Status == "pending" {
-    done, err := c.IngestTraceAndWait(ctx, panelsdk.IngestTraceInput{
-        SourceAgent: "myapp",
-        Blob: map[string]interface{}{"messages": []string{"hello"}},
-    }, 60, 1.5)
-    _ = done
-    _ = err
+status, err := c.GetTrace(ctx, tr.TraceID)
+if err != nil {
+	log.Fatal(err)
 }
+fmt.Println(status.Status)
+```
+
+## Submit judgment
+
+```go
+j, err := c.SubmitJudgment(ctx, panelsdk.JudgmentInput{
+	UnitID:    "u_123",
+	RaterID:   "operator-1",
+	Choice:    "yes",
+	LatencyMS: 3000,
+})
+if err != nil {
+	log.Fatal(err)
+}
+fmt.Println(j.OK, j.Token)
+```
+
+## Scrub text
+
+```go
+c = panelsdk.New(panelsdk.Options{
+	BaseURL:     "https://panel.example.com",
+	ScrubberURL: "https://scrubber.example.com",
+})
+
+sr, err := c.Scrub(ctx, "email me at test@example.com")
+if err != nil {
+	log.Fatal(err)
+}
+fmt.Println(sr.Scrubbed)
 ```

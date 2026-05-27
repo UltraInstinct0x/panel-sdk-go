@@ -7,6 +7,7 @@ import (
 )
 
 const DefaultEngineVersion = "0.2.0"
+const Version = "0.2.0"
 
 type Options struct {
 	BaseURL          string
@@ -25,6 +26,8 @@ type Options struct {
 type Client struct {
 	panel *PanelClient
 	Rater *RaterClient
+	o     Options
+	http  *http.Client
 }
 
 func New(o Options) *Client {
@@ -37,7 +40,7 @@ func New(o Options) *Client {
 
 	panel := &PanelClient{o: o, http: hc}
 	rater := &RaterClient{o: o, http: hc}
-	return &Client{panel: panel, Rater: rater}
+	return &Client{panel: panel, Rater: rater, o: o, http: hc}
 }
 
 func normalizeOptions(o Options) Options {

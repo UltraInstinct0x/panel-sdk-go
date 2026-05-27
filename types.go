@@ -54,10 +54,10 @@ type SkillReviewInput struct {
 }
 
 type SkillReviewResult struct {
-	UnitID    string `json:"unit_id"`
-	PollURL   string `json:"poll_url"`
+	UnitID     string `json:"unit_id"`
+	PollURL    string `json:"poll_url"`
 	VerdictURL string `json:"verdict_url"`
-	Created   bool   `json:"created"`
+	Created    bool   `json:"created"`
 }
 
 type ScoreResult struct {
@@ -75,4 +75,60 @@ type SubmitJudgmentInput struct {
 	UnitID  string `json:"unit_id"`
 	Choice  string `json:"choice"`
 	RaterID string `json:"rater_id,omitempty"`
+}
+
+type IngestUnitInput struct {
+	Type        string      `json:"type"`
+	Pool        string      `json:"pool,omitempty"`
+	Payload     interface{} `json:"payload,omitempty"`
+	ExternalRef string      `json:"external_ref,omitempty"`
+	SourceAgent string      `json:"source_agent,omitempty"`
+	Question    string      `json:"question,omitempty"`
+}
+
+type IngestUnitResult struct {
+	OK       bool                     `json:"ok"`
+	Accepted int                      `json:"accepted"`
+	Rejected int                      `json:"rejected"`
+	IDs      []string                 `json:"ids,omitempty"`
+	Errors   []map[string]interface{} `json:"errors,omitempty"`
+}
+
+type TraceStatus struct {
+	TraceID         string   `json:"trace_id"`
+	Status          string   `json:"status"`
+	BlobSize        *int64   `json:"blob_size,omitempty"`
+	IngestedAt      *string  `json:"ingested_at,omitempty"`
+	UnitIDs         []string `json:"unit_ids,omitempty"`
+	StructuralCount *int     `json:"structural_count,omitempty"`
+	LLMCount        *int     `json:"llm_count,omitempty"`
+	SkippedCount    *int     `json:"skipped_count,omitempty"`
+	Error           *string  `json:"error,omitempty"`
+}
+
+type JudgmentInput struct {
+	UnitID     string      `json:"unit_id"`
+	RaterID    string      `json:"rater_id"`
+	Choice     string      `json:"choice"`
+	LatencyMS  int         `json:"latency_ms,omitempty"`
+	Confidence float64     `json:"confidence,omitempty"`
+	Behavioral interface{} `json:"behavioral,omitempty"`
+}
+
+type JudgmentResult struct {
+	OK                  bool    `json:"ok"`
+	Token               string  `json:"token,omitempty"`
+	Trust               float64 `json:"trust,omitempty"`
+	TrustDelta          float64 `json:"trust_delta,omitempty"`
+	EarnedCents         int     `json:"earned_cents,omitempty"`
+	JudgmentsCount      int     `json:"judgments_count,omitempty"`
+	DemoAgreedWithGold  bool    `json:"_demo_agreed_with_gold,omitempty"`
+	DemoHoneypotFailed  bool    `json:"_demo_honeypot_failed,omitempty"`
+	DemoBehavioralScore float64 `json:"_demo_behavioral_score,omitempty"`
+}
+
+type ScrubResult struct {
+	Scrubbed  string                 `json:"scrubbed"`
+	MappingID string                 `json:"mapping_id,omitempty"`
+	Extra     map[string]interface{} `json:"-"`
 }

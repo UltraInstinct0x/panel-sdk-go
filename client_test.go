@@ -169,3 +169,63 @@ func TestScoreUnitCanonicalSignature(t *testing.T) {
 		t.Fatalf("canonical sig mismatch got=%s want=%s", sig, want)
 	}
 }
+
+func TestIngestUnitSignsExactBodyBytes(t *testing.T) {
+	var gotBody []byte
+	var gotSig string
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/units/ingest" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		var err error
+		gotBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gotSig = r.Header.Get("x-panel-ingest-sig")
+		_, _ = w.Write([]byte(`{"ok":true,"accepted":1,"rejected":0,"ids":["u_ing_1"],"errors":[]}`))
+	}))
+	defer ts.Close()
+
+	c := New(Options{BaseURL: ts.URL, SiteKey: "pk_test", SiteSecret: "sek"})
+	_, err := c.IngestUnit(context.Background(), IngestUnitInput{Type: "process_output_rating", Payload: map[string]interface{}{"passage": "hello"}}, WithExternalRef("ref-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := hmac.New(sha256.New, []byte("sek"))
+	_, _ = m.Write(gotBody)
+	if want := hex.EncodeToString(m.Sum(nil)); gotSig != want {
+		t.Fatalf("sig mismatch got=%q want=%q", gotSig, want)
+	}
+}
+
+func TestSubmitJudgmentSignsExactBodyBytes(t *testing.T) {
+	var gotBody []byte
+	var gotSig string
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/judgments" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		var err error
+		gotBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gotSig = r.Header.Get("x-panel-ingest-sig")
+		_, _ = w.Write([]byte(`{"ok":true,"token":"tok"}`))
+	}))
+	defer ts.Close()
+
+	c := New(Options{BaseURL: ts.URL, SiteKey: "pk_test", SiteSecret: "sek"})
+	_, err := c.SubmitJudgment(context.Background(), JudgmentInput{UnitID: "u1", RaterID: "r1", Choice: "yes", LatencyMS: 2600})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := hmac.New(sha256.New, []byte("sek"))
+	_, _ = m.Write(gotBody)
+	if want := hex.EncodeToString(m.Sum(nil)); gotSig != want {
+		t.Fatalf("sig mismatch got=%q want=%q", gotSig, want)
+	}
+}

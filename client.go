@@ -1,205 +1,303 @@
-// Package panelsdk is a thin client for the panel HTTP api.
-// See https://github.com/UltraInstinct0x/panel for the server.
 package panelsdk
 
 import (
 	"bytes"
-	"crypto/hmac"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/hex"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
 
-const DefaultEngineVersion = "0.2.0"
-
-// Options configures a Client.
-type Options struct {
-	BaseURL         string
-	SiteKey         string
-	SiteSecret      string
-	ScrubberSecret  string // optional; required for third-party site keys
-	EngineVersion   string // default "0.2.0"
-	HTTPClient      *http.Client
-}
-
-// Client is the panel HTTP client.
-type Client struct {
+type PanelClient struct {
 	o    Options
 	http *http.Client
 }
 
-// New returns a configured Client.
-func New(o Options) *Client {
-	if o.EngineVersion == "" {
-		o.EngineVersion = DefaultEngineVersion
+func (c *Client) IngestTrace(ctx context.Context, in IngestTraceInput) (*TraceResult, error) {
+	return c.panel.IngestTrace(ctx, in)
+}
+
+func (c *Client) IngestTraceAndWait(ctx context.Context, in IngestTraceInput, maxWaitSeconds float64, pollIntervalSeconds float64) (*FetchTraceResult, error) {
+	return c.panel.IngestTraceAndWait(ctx, in, maxWaitSeconds, pollIntervalSeconds)
+}
+
+func (c *Client) FetchTrace(ctx context.Context, id string) (*FetchTraceResult, error) {
+	return c.panel.FetchTrace(ctx, id)
+}
+
+func (c *Client) IngestUnits(ctx context.Context, payload interface{}) (map[string]interface{}, error) {
+	return c.panel.IngestUnits(ctx, payload)
+}
+
+func (c *Client) ScoreUnit(ctx context.Context, ref string, id string) (*ScoreResult, error) {
+	return c.panel.ScoreUnit(ctx, ref, id)
+}
+
+func (c *Client) SkillReview(ctx context.Context, in SkillReviewInput) (*SkillReviewResult, error) {
+	return c.panel.SkillReview(ctx, in)
+}
+
+func (c *Client) VerifyToken(ctx context.Context, token string) (*VerifyResult, error) {
+	return c.panel.VerifyToken(ctx, token)
+}
+
+func (c *PanelClient) IngestTrace(ctx context.Context, in IngestTraceInput) (*TraceResult, error) {
+	body, err := json.Marshal(in)
+	if err != nil {
+		return nil, fmt.Errorf("marshal ingest trace body: %w", err)
 	}
-	hc := o.HTTPClient
-	if hc == nil {
-		hc = &http.Client{Timeout: 10 * time.Second}
-	}
-	o.BaseURL = strings.TrimRight(o.BaseURL, "/")
-	return &Client{o: o, http: hc}
-}
-
-// Error is returned for non-2xx responses.
-type Error struct {
-	Status int
-	Body   []byte
-}
-
-func (e *Error) Error() string {
-	return fmt.Sprintf("panel %d: %s", e.Status, truncate(string(e.Body), 300))
-}
-
-// VerifyResult is the response shape from /v1/verify.
-type VerifyResult struct {
-	OK       bool     `json:"ok"`
-	Trust    *float64 `json:"trust,omitempty"`
-	TierUsed string   `json:"tier_used,omitempty"`
-	UnitIDs  []string `json:"unit_ids,omitempty"`
-	Reason   string   `json:"reason,omitempty"`
-}
-
-// IngestUnitInput is the request body for ingestUnit.
-type IngestUnitInput struct {
-	Type    string                 `json:"type"`
-	Pool    string                 `json:"pool,omitempty"`
-	Payload map[string]interface{} `json:"payload"`
-}
-
-// IngestTraceInput is the request body for ingestTrace.
-type IngestTraceInput struct {
-	TraceID     string                 `json:"trace_id"`
-	SourceAgent string                 `json:"source_agent"`
-	Blob        map[string]interface{} `json:"blob"`
-}
-
-// IngestUnit posts a single unit.
-func (c *Client) IngestUnit(in IngestUnitInput) (map[string]interface{}, error) {
-	body, _ := json.Marshal(in)
-	return c.postSigned("/api/units/ingest", body)
-}
-
-// IngestTrace posts a trace for splitting.
-func (c *Client) IngestTrace(in IngestTraceInput) (map[string]interface{}, error) {
-	body, _ := json.Marshal(in)
-	return c.postSigned("/api/v1/traces", body)
-}
-
-// VerifyToken verifies a widget token server-side.
-func (c *Client) VerifyToken(token string) (*VerifyResult, error) {
-	body, _ := json.Marshal(map[string]string{"token": token, "site_key": c.o.SiteKey})
-	req, _ := http.NewRequest("POST", c.o.BaseURL+"/v1/verify", bytes.NewReader(body))
-	req.Header.Set("content-type", "application/json")
-	var out VerifyResult
-	if err := c.do(req, &out); err != nil {
+	res, status, err := c.signedJSON(ctx, http.MethodPost, "/api/v1/traces", nil, body)
+	if err != nil {
 		return nil, err
+	}
+	if status == http.StatusAccepted {
+		var pending struct {
+			TraceID string `json:"trace_id"`
+			Status  string `json:"status"`
+			Poll    string `json:"poll"`
+		}
+		if err := json.Unmarshal(res, &pending); err != nil {
+			return nil, fmt.Errorf("parse pending ingest trace response: %w", err)
+		}
+		pollURL := pending.Poll
+		if strings.HasPrefix(pollURL, "/") {
+			pollURL = c.o.BaseURL + "/api" + strings.TrimPrefix(pollURL, "/v1")
+		}
+		return &TraceResult{Status: "pending", TraceID: pending.TraceID, PollURL: &pollURL}, nil
+	}
+
+	var out struct {
+		TraceID         string   `json:"trace_id"`
+		UnitIDs         []string `json:"unit_ids"`
+		StructuralCount int      `json:"structural_count"`
+		LLMCount        int      `json:"llm_count"`
+		SkippedCount    int      `json:"skipped_count"`
+	}
+	if err := json.Unmarshal(res, &out); err != nil {
+		return nil, fmt.Errorf("parse ingest trace response: %w", err)
+	}
+	return &TraceResult{
+		Status:          "done",
+		TraceID:         out.TraceID,
+		UnitIDs:         out.UnitIDs,
+		StructuralCount: &out.StructuralCount,
+		LLMCount:        &out.LLMCount,
+		SkippedCount:    &out.SkippedCount,
+	}, nil
+}
+
+func (c *PanelClient) IngestTraceAndWait(ctx context.Context, in IngestTraceInput, maxWaitSeconds float64, pollIntervalSeconds float64) (*FetchTraceResult, error) {
+	if maxWaitSeconds <= 0 {
+		maxWaitSeconds = 60
+	}
+	if pollIntervalSeconds <= 0 {
+		pollIntervalSeconds = 1.5
+	}
+	res, err := c.IngestTrace(ctx, in)
+	if err != nil {
+		return nil, err
+	}
+	if res.Status == "done" {
+		return &FetchTraceResult{
+			TraceID:         res.TraceID,
+			Status:          "done",
+			UnitIDs:         res.UnitIDs,
+			StructuralCount: res.StructuralCount,
+			LLMCount:        res.LLMCount,
+			SkippedCount:    res.SkippedCount,
+		}, nil
+	}
+	deadline := time.Now().Add(durationFromSeconds(maxWaitSeconds))
+	for time.Now().Before(deadline) {
+		fetched, err := c.FetchTrace(ctx, res.TraceID)
+		if err != nil {
+			return nil, err
+		}
+		if fetched.Status != "pending" {
+			return fetched, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(durationFromSeconds(pollIntervalSeconds)):
+		}
+	}
+	return nil, fmt.Errorf("trace wait timed out after %.2fs", maxWaitSeconds)
+}
+
+func (c *PanelClient) FetchTrace(ctx context.Context, id string) (*FetchTraceResult, error) {
+	path := "/api/v1/traces/" + url.PathEscape(id)
+	b, _, err := c.signedJSON(ctx, http.MethodGet, path, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	var out FetchTraceResult
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil, fmt.Errorf("parse fetch trace response: %w", err)
 	}
 	return &out, nil
 }
 
-// FetchUnit gets a unit by id.
-func (c *Client) FetchUnit(id string) (map[string]interface{}, error) {
-	return c.get("/api/units/" + id)
+func (c *PanelClient) IngestUnits(ctx context.Context, payload interface{}) (map[string]interface{}, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal ingest units body: %w", err)
+	}
+	b, _, err := c.signedJSON(ctx, http.MethodPost, "/api/units/ingest", nil, body)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]interface{}
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil, fmt.Errorf("parse ingest units response: %w", err)
+	}
+	return out, nil
 }
 
-// FetchTrace gets a trace by id.
-func (c *Client) FetchTrace(id string) (map[string]interface{}, error) {
-	return c.get("/api/v1/traces/" + id)
+func (c *PanelClient) ScoreUnit(ctx context.Context, ref string, id string) (*ScoreResult, error) {
+	query := url.Values{}
+	if ref != "" {
+		query.Set("ref", ref)
+	}
+	if id != "" {
+		query.Set("id", id)
+	}
+	canonical := scoreCanonicalString(c.o.SiteKey, ref, id)
+	headers := map[string]string{"x-panel-ingest-sig": hmacHex(c.o.SiteSecret, []byte(canonical))}
+	b, _, err := c.signedJSON(ctx, http.MethodGet, "/api/units/score", query, nil, headers)
+	if err != nil {
+		return nil, err
+	}
+	var out ScoreResult
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil, fmt.Errorf("parse score response: %w", err)
+	}
+	return &out, nil
 }
 
-// --- internals -----------------------------------------------------
+func (c *PanelClient) SkillReview(ctx context.Context, in SkillReviewInput) (*SkillReviewResult, error) {
+	body, err := json.Marshal(in)
+	if err != nil {
+		return nil, fmt.Errorf("marshal skill review body: %w", err)
+	}
+	b, _, err := c.signedJSON(ctx, http.MethodPost, "/api/v1/skill-review", nil, body)
+	if err != nil {
+		return nil, err
+	}
+	var out SkillReviewResult
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil, fmt.Errorf("parse skill review response: %w", err)
+	}
+	return &out, nil
+}
 
-func (c *Client) postSigned(path string, body []byte) (map[string]interface{}, error) {
-	req, _ := http.NewRequest("POST", c.o.BaseURL+path, bytes.NewReader(body))
+func (c *PanelClient) VerifyToken(ctx context.Context, token string) (*VerifyResult, error) {
+	body, err := json.Marshal(map[string]string{"token": token, "site_key": c.o.SiteKey})
+	if err != nil {
+		return nil, fmt.Errorf("marshal verify token body: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.o.BaseURL+"/v1/verify", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("build verify request: %w", err)
+	}
 	req.Header.Set("content-type", "application/json")
+	b, _, err := c.do(req)
+	if err != nil {
+		return nil, err
+	}
+	var out VerifyResult
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil, fmt.Errorf("parse verify response: %w", err)
+	}
+	return &out, nil
+}
+
+func (c *PanelClient) signedJSON(ctx context.Context, method string, path string, query url.Values, body []byte, extraHeaders ...map[string]string) ([]byte, int, error) {
+	bodyToSend := body
+	attestation := ""
+	var err error
+	if method == http.MethodPost && (path == "/api/v1/traces" || path == "/api/units/ingest") {
+		bodyToSend, attestation, err = c.scrubberMode(ctx, body)
+		if err != nil {
+			return nil, 0, err
+		}
+	}
+
+	u := c.o.BaseURL + path
+	if query != nil {
+		q := query.Encode()
+		if q != "" {
+			u += "?" + q
+		}
+	}
+
+	var reader io.Reader
+	if bodyToSend != nil {
+		reader = bytes.NewReader(bodyToSend)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, u, reader)
+	if err != nil {
+		return nil, 0, fmt.Errorf("build request: %w", err)
+	}
+	if bodyToSend != nil {
+		req.Header.Set("content-type", "application/json")
+	}
 	req.Header.Set("x-panel-site-key", c.o.SiteKey)
-	req.Header.Set("x-panel-ingest-sig", hmacHex(c.o.SiteSecret, body))
-	if c.o.ScrubberSecret != "" {
-		req.Header.Set("x-scrubber-attestation", c.attest(body))
+	if c.o.SiteSecret != "" {
+		sigPayload := bodyToSend
+		if sigPayload == nil {
+			sigPayload = []byte{}
+		}
+		req.Header.Set("x-panel-ingest-sig", hmacHex(c.o.SiteSecret, sigPayload))
 	}
-	var out map[string]interface{}
-	if err := c.do(req, &out); err != nil {
-		return nil, err
+	if c.o.SiteSecretSource == "raw" {
+		req.Header.Set("x-panel-ingest-secret", c.o.SiteSecret)
 	}
-	return out, nil
+	if attestation != "" {
+		req.Header.Set("x-scrubber-attestation", attestation)
+	}
+	if len(extraHeaders) > 0 {
+		for k, v := range extraHeaders[0] {
+			req.Header.Set(k, v)
+		}
+	}
+
+	return c.do(req)
 }
 
-func (c *Client) get(path string) (map[string]interface{}, error) {
-	req, _ := http.NewRequest("GET", c.o.BaseURL+path, nil)
-	var out map[string]interface{}
-	if err := c.do(req, &out); err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *Client) do(req *http.Request, out interface{}) error {
+func (c *PanelClient) do(req *http.Request) ([]byte, int, error) {
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return err
+		return nil, 0, fmt.Errorf("http request failed: %w", err)
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, resp.StatusCode, fmt.Errorf("read response body: %w", err)
+	}
+
+	if resp.StatusCode == http.StatusTooManyRequests {
+		var rl struct {
+			Error       string `json:"error"`
+			Scope       string `json:"scope"`
+			RetryAfterS int    `json:"retry_after_s"`
+		}
+		_ = json.Unmarshal(b, &rl)
+		if rl.RetryAfterS == 0 {
+			ra := resp.Header.Get("Retry-After")
+			if ra != "" {
+				rl.RetryAfterS, _ = strconv.Atoi(ra)
+			}
+		}
+		return nil, resp.StatusCode, &RateLimitError{Scope: rl.Scope, RetryAfter: rl.RetryAfterS, Status: resp.StatusCode, Body: b}
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return &Error{Status: resp.StatusCode, Body: b}
+		return nil, resp.StatusCode, &Error{Status: resp.StatusCode, Body: b}
 	}
-	if out == nil || len(b) == 0 {
-		return nil
-	}
-	return json.Unmarshal(b, out)
-}
-
-func (c *Client) attest(body []byte) string {
-	now := time.Now().Unix()
-	jti := make([]byte, 16)
-	_, _ = rand.Read(jti)
-	payload := map[string]interface{}{
-		"jti":            hex.EncodeToString(jti),
-		"iat":            now,
-		"exp":            now + 300,
-		"input_hash":     "x",
-		"output_hash":    sha256Hex(body),
-		"mode":           "text",
-		"engine_version": c.o.EngineVersion,
-	}
-	return jwtHS256(c.o.ScrubberSecret, payload)
-}
-
-func hmacHex(secret string, body []byte) string {
-	m := hmac.New(sha256.New, []byte(secret))
-	m.Write(body)
-	return hex.EncodeToString(m.Sum(nil))
-}
-
-func sha256Hex(body []byte) string {
-	s := sha256.Sum256(body)
-	return hex.EncodeToString(s[:])
-}
-
-func b64u(b []byte) string {
-	return strings.TrimRight(base64.URLEncoding.EncodeToString(b), "=")
-}
-
-func jwtHS256(secret string, payload map[string]interface{}) string {
-	headerB, _ := json.Marshal(map[string]string{"alg": "HS256", "typ": "JWT"})
-	payloadB, _ := json.Marshal(payload)
-	si := b64u(headerB) + "." + b64u(payloadB)
-	m := hmac.New(sha256.New, []byte(secret))
-	m.Write([]byte(si))
-	return si + "." + b64u(m.Sum(nil))
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n]
+	return b, resp.StatusCode, nil
 }

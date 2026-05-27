@@ -1,6 +1,7 @@
 package panelsdk
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
@@ -10,120 +11,161 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
-func TestIngestUnitSignsBody(t *testing.T) {
-	var sig, key, attest string
+func TestIngestTraceSignsBody(t *testing.T) {
 	var bodyBytes []byte
+	var gotSig string
+
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		bodyBytes, _ = io.ReadAll(r.Body)
-		sig = r.Header.Get("x-panel-ingest-sig")
-		key = r.Header.Get("x-panel-site-key")
-		attest = r.Header.Get("x-scrubber-attestation")
-		_, _ = w.Write([]byte(`{"id":"u_1"}`))
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/traces" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		var err error
+		bodyBytes, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gotSig = r.Header.Get("x-panel-ingest-sig")
+		_, _ = w.Write([]byte(`{"trace_id":"tr_1","unit_ids":["u_1"],"structural_count":1,"llm_count":2,"skipped_count":0}`))
 	}))
 	defer ts.Close()
+
 	c := New(Options{BaseURL: ts.URL, SiteKey: "pk_test", SiteSecret: "sek"})
-	out, err := c.IngestUnit(IngestUnitInput{Type: "step_validity", Payload: map[string]interface{}{"foo": 1}})
+	_, err := c.IngestTrace(context.Background(), IngestTraceInput{SourceAgent: "sdk", Blob: map[string]interface{}{"k": "v"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out["id"] != "u_1" {
-		t.Fatalf("unexpected: %#v", out)
-	}
-	if key != "pk_test" {
-		t.Fatalf("site key: %q", key)
-	}
-	if attest != "" {
-		t.Fatalf("attestation should be empty when no scrubber secret: %q", attest)
-	}
 	m := hmac.New(sha256.New, []byte("sek"))
-	m.Write(bodyBytes)
-	if want := hex.EncodeToString(m.Sum(nil)); sig != want {
-		t.Fatalf("sig %q != want %q", sig, want)
+	_, _ = m.Write(bodyBytes)
+	if want := hex.EncodeToString(m.Sum(nil)); gotSig != want {
+		t.Fatalf("sig mismatch got=%q want=%q", gotSig, want)
 	}
 }
 
-func TestIngestTraceAttachesAttestation(t *testing.T) {
-	var attest string
-	var bodyBytes []byte
+func TestSelfSignScrubberJWT(t *testing.T) {
+	var attestation string
+	var posted []byte
+
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		bodyBytes, _ = io.ReadAll(r.Body)
-		attest = r.Header.Get("x-scrubber-attestation")
-		_, _ = w.Write([]byte(`{"trace_id":"tr_1","units_emitted":3}`))
+		if r.URL.Path != "/api/units/ingest" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		attestation = r.Header.Get("x-scrubber-attestation")
+		posted, _ = io.ReadAll(r.Body)
+		_, _ = w.Write([]byte(`{"ok":true}`))
 	}))
 	defer ts.Close()
-	c := New(Options{BaseURL: ts.URL, SiteKey: "pk_test", SiteSecret: "sek", ScrubberSecret: "scrub"})
-	_, err := c.IngestTrace(IngestTraceInput{TraceID: "tr_1", SourceAgent: "hermes", Blob: map[string]interface{}{"messages": []interface{}{}}})
+
+	c := New(Options{
+		BaseURL:        ts.URL,
+		SiteKey:        "pk_test",
+		SiteSecret:     "sek",
+		ScrubberMode:   "self-sign",
+		ScrubberSecret: "scrub-secret",
+	})
+	_, err := c.IngestUnits(context.Background(), map[string]interface{}{"units": []interface{}{map[string]interface{}{"type": "ai_output_rating", "image_url": "https://x"}}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	parts := strings.Split(attest, ".")
+	parts := strings.Split(attestation, ".")
 	if len(parts) != 3 {
-		t.Fatalf("attest parts: %d", len(parts))
+		t.Fatalf("invalid jwt parts: %d", len(parts))
 	}
-	pb, err := base64.RawURLEncoding.DecodeString(parts[1])
+	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
 		t.Fatal(err)
 	}
 	var payload map[string]interface{}
-	_ = json.Unmarshal(pb, &payload)
-	want := sha256Hex(bodyBytes)
-	if payload["output_hash"] != want {
-		t.Fatalf("output_hash %v != %s", payload["output_hash"], want)
+	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["output_hash"] != sha256Hex(posted) {
+		t.Fatalf("output_hash mismatch: got=%v want=%s", payload["output_hash"], sha256Hex(posted))
+	}
+	if payload["engine_version"] != DefaultEngineVersion {
+		t.Fatalf("engine_version mismatch: %v", payload["engine_version"])
 	}
 }
 
-func TestVerifyTokenParses(t *testing.T) {
+func TestIngestTraceAndWaitCompletes(t *testing.T) {
+	var polls int32
+
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"ok":true,"trust":0.8,"tier_used":"C1","unit_ids":["u_a"]}`))
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/traces":
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"trace_id":"tr_wait","status":"pending","poll":"/v1/traces/tr_wait"}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/traces/tr_wait":
+			if atomic.AddInt32(&polls, 1) < 2 {
+				w.WriteHeader(http.StatusAccepted)
+				_, _ = w.Write([]byte(`{"trace_id":"tr_wait","status":"pending"}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"trace_id":"tr_wait","status":"done","unit_ids":["u_1"]}`))
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
 	}))
 	defer ts.Close()
+
 	c := New(Options{BaseURL: ts.URL, SiteKey: "pk_test", SiteSecret: "sek"})
-	v, err := c.VerifyToken("t.t.t")
+	res, err := c.IngestTraceAndWait(context.Background(), IngestTraceInput{SourceAgent: "sdk", Blob: map[string]interface{}{"x": 1}}, 2, 0.01)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !v.OK || v.TierUsed != "C1" || v.Trust == nil || *v.Trust != 0.8 {
-		t.Fatalf("unexpected: %#v", v)
+	if res.Status != "done" || res.TraceID != "tr_wait" {
+		t.Fatalf("unexpected result: %#v", res)
 	}
 }
 
-func TestNon2xxReturnsError(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(422)
-		_, _ = w.Write([]byte(`{"error":"scrubber_attestation_required"}`))
-	}))
-	defer ts.Close()
-	c := New(Options{BaseURL: ts.URL, SiteKey: "pk_test", SiteSecret: "sek"})
-	_, err := c.IngestUnit(IngestUnitInput{Type: "x", Payload: map[string]interface{}{}})
-	if err == nil {
-		t.Fatal("expected error")
-	}
-	pe, ok := err.(*Error)
-	if !ok || pe.Status != 422 {
-		t.Fatalf("not panel Error 422: %#v", err)
-	}
-}
+func TestRetry429ThenSuccess(t *testing.T) {
+	var calls int32
 
-func TestFetchTraceUsesGET(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "GET" {
-			t.Fatalf("method %s", r.Method)
+		if atomic.AddInt32(&calls, 1) == 1 {
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":"rate_limited","scope":"ingest","retry_after_s":0}`))
+			return
 		}
-		if r.URL.Path != "/api/v1/traces/tr_y" {
-			t.Fatalf("path %s", r.URL.Path)
-		}
-		_, _ = w.Write([]byte(`{"trace_id":"tr_y"}`))
+		_, _ = w.Write([]byte(`{"trace_id":"tr_2","unit_ids":[],"structural_count":0,"llm_count":0,"skipped_count":0}`))
 	}))
 	defer ts.Close()
-	c := New(Options{BaseURL: ts.URL + "/", SiteKey: "pk_test", SiteSecret: "sek"})
-	out, err := c.FetchTrace("tr_y")
+
+	c := New(Options{BaseURL: ts.URL, SiteKey: "pk_test", SiteSecret: "sek", MaxRetries: 1})
+	_, err := c.IngestTrace(context.Background(), IngestTraceInput{SourceAgent: "sdk", Blob: map[string]interface{}{"x": 1}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out["trace_id"] != "tr_y" {
-		t.Fatalf("unexpected: %#v", out)
+	if calls != 2 {
+		t.Fatalf("expected 2 calls, got %d", calls)
+	}
+}
+
+func TestScoreUnitCanonicalSignature(t *testing.T) {
+	var sig string
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/units/score" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		sig = r.Header.Get("x-panel-ingest-sig")
+		_, _ = w.Write([]byte(`{"counts":{"yes":1},"trust_weighted_score":0.9}`))
+	}))
+	defer ts.Close()
+
+	c := New(Options{BaseURL: ts.URL, SiteKey: "pk_test", SiteSecret: "sek"})
+	_, err := c.ScoreUnit(context.Background(), "ext_1", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical := "GET\n/api/units/score\nref=ext_1\nsite=pk_test"
+	m := hmac.New(sha256.New, []byte("sek"))
+	_, _ = m.Write([]byte(canonical))
+	if want := hex.EncodeToString(m.Sum(nil)); sig != want {
+		t.Fatalf("canonical sig mismatch got=%s want=%s", sig, want)
 	}
 }
